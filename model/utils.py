@@ -1,12 +1,16 @@
 from __future__ import print_function
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Chem import rdmolops
+
+from itertools import product, combinations
+from collections import Counter
 from collections import defaultdict
 import copy
 import numpy as np
 import torch
 import dill
-from itertools import product, combinations
+import re
 import signal
 
 def read_smiles(file_path, binary = None):
@@ -20,6 +24,10 @@ def read_smiles(file_path, binary = None):
         with open(file_path, 'rb') as f:
             smiles = dill.load(f)
     else:
+        if file_path.endswith('.sdf'):
+            suppl = Chem.SDMolSupplier(file_path)
+            smiles = [Chem.MolToSmiles(mol) for mol in suppl]
+
         with open(file_path, 'r') as f:
             smiles = [line.strip("\r\n ").split()[0] for line in f]
             
@@ -39,6 +47,17 @@ def save_smiles(smiles, file_path, binary = None):
         with open(file_path, 'w') as f:
             for smi in smiles:
                 f.write(smi + '\n')
+
+def save_mol(mols, file_path):
+    writer = Chem.SDWriter(file_path)
+    for mol in mols:
+        writer.write(mol)
+    writer.close()
+
+def load_mol(file_path):
+    suppl = Chem.SDMolSupplier(file_path)
+    mols = [mol for mol in suppl]
+    return mols
 
 def set_atommap(mol, num = 0):
     for i,atom in enumerate(mol.GetAtoms(), start = num):
@@ -73,7 +92,8 @@ def add_Hs(rwmol, a1, a2, bond):
     elif str(bond.GetBondType()) == 'TRIPLE':
         num = 3
     elif str(bond.GetBondType()) == 'AROMATIC':
-        print("error in add_Hs 1")
+        # print("error in add_Hs 1")
+        return rwmol
     else:
         print("error in add_Hs 2")
         
@@ -86,89 +106,94 @@ def add_Hs(rwmol, a1, a2, bond):
         rwmol.AddBond(new_idx, a2.GetIdx(), Chem.BondType.SINGLE)
     return rwmol
 
-#Calculate frequency after decomposition
-def count_fragments(mol):
-    mol = Chem.rdmolops.RemoveHs(mol)
-    new_mol = Chem.RWMol(mol)
-    for atom in new_mol.GetAtoms():
-        atom.SetAtomMapNum(atom.GetIdx())
-    sep_sets = [] #Set of atom maps of joints
+def get_atom_tokens(mol):
+    """
+    Extract tokens for individual atoms in a molecule, representing their bonding and structure.
+    One bond type is prefixed for each atom token.
     
-    for bond in mol.GetBonds():
-        if bond.IsInRing(): continue
-        a1 = bond.GetBeginAtom()
-        a2 = bond.GetEndAtom()
-        #If both are inside the ring, split there.
-        if a1.IsInRing() and a2.IsInRing():
-            sep_sets.append((a1.GetIdx(), a2.GetIdx()))
-        #If one atom is in a ring and the other has a bond order greater than 2, split there.
-        elif (a1.IsInRing() and a2.GetDegree() > 1) or (a2.IsInRing() and a1.GetDegree() > 1):
-            sep_sets.append((a1.GetIdx(), a2.GetIdx()))   
-    sep_idx = 1
-    atommap_dict = defaultdict(list) #key->AtomIdx, value->sep_idx (In the whole compound before decomposition)
-    for bond in mol.GetBonds():
-        a1 = bond.GetBeginAtom()
-        a2 = bond.GetEndAtom()
-        if ((a1.GetIdx(),a2.GetIdx()) in sep_sets) or ((a2.GetIdx(),a1.GetIdx()) in sep_sets):
-            a1map = new_mol.GetAtomWithIdx(a1.GetIdx()).GetAtomMapNum()
-            a2map = new_mol.GetAtomWithIdx(a2.GetIdx()).GetAtomMapNum()
-            atommap_dict[a1map].append(sep_idx)
-            atommap_dict[a2map].append(sep_idx)
-            new_mol = add_Hs(new_mol, a1, a2, bond)
-            new_mol.RemoveBond(a1.GetIdx(), a2.GetIdx())
-            sep_idx += 1
-    for i in list(atommap_dict.keys()):
-        atommap_dict[i] = sorted(atommap_dict[i])  
-    for i in list(atommap_dict.keys()):
-        if atommap_dict[i] == []:
-            atommap_dict.pop(i)
-    new_mol = new_mol.GetMol()
-    new_mol = sanitize(new_mol, kekulize = False)
-    new_smiles = Chem.MolToSmiles(new_mol)
-    fragments = [Chem.MolFromSmiles(fragment) for fragment in new_smiles.split('.')]
-    fragments = [sanitize(fragment, kekulize = False) for fragment in fragments]
+    Parameters:
+        mol (Chem.Mol): The molecule to analyze (RDKit Mol object).
     
-    count_labels = []
-    for i, fragment in enumerate(fragments):
-        order_list = [] #Stores join orders in the substructures
-        count_label = []
-        frag_mol = copy.deepcopy(fragment)
-        for atom in frag_mol.GetAtoms():
-            frag_mol.GetAtomWithIdx(atom.GetIdx()).SetAtomMapNum(0)
-        frag_smi = Chem.MolToSmiles(sanitize(frag_mol, kekulize = False))
-        #Fix AtomIdx as order changes when AtomMap is deleted.
-        atom_order = list(map(int, frag_mol.GetProp("_smilesAtomOutputOrder")[1:-2].split(",")))
-        for atom in fragment.GetAtoms():
-            amap = atom.GetAtomMapNum()
-            if amap in list(atommap_dict.keys()):
-                order_list.append(atommap_dict[amap])
-        order_list = sorted(order_list)
-        count_label.append(frag_smi)
-        for atom in fragment.GetAtoms():
-            amap = atom.GetAtomMapNum()
-            if amap in list(atommap_dict.keys()):
-                for seq_idx in atommap_dict[amap]:
-                    for amap2 in list(atommap_dict.keys()):
-                        if (seq_idx in atommap_dict[amap2]) and (amap != amap2):
-                            bond = mol.GetBondBetweenAtoms(amap, amap2)
-                            bond_type = bond.GetBondType()
-                            bond_type_str = ""
-                            if bond_type == Chem.BondType.SINGLE:
-                                bond_type_str = "SINGLE"
-                            elif bond_type == Chem.BondType.DOUBLE:
-                                bond_type_str = "DOUBLE"
-                            elif bond_type == Chem.BondType.TRIPLE:
-                                bond_type_str = "TRIPLE"
-                            elif bond_type == Chem.BondType.AROMATIC:
-                                bond_type_str = "AROMATIC"
+    Returns:
+        list: A list of unique atom tokens in the format "<first_bonding_type><atom_symbol>".
+    """
+    sort_order = {'-': 0, '=': 1, '#': 2, ':': 3}
 
-                            count_label.append(atom_order.index(atom.GetIdx()))
-                            count_label.append(bond_type_str)
-                            count_label.append(order_list.index(atommap_dict[amap]) + 1)
+    atom_tokens = set()
     
-        count_label = normalize_bond_info(count_label)
-        count_labels.append(tuple(count_label))
-    return count_labels, fragments
+    for atom in mol.GetAtoms():
+        atom_symbol = atom.GetSymbol()  # Get the symbol of the atom (e.g., 'C', 'O')
+        if atom_symbol == "H":  # Skip hydrogen
+            continue
+        bonding_type = "-"
+        
+        # Find the first bond type for this atom
+        bonds = atom.GetBonds()
+        bond_tokens = []
+        if bonds:
+            for bond in bonds:  # Process all bonds for the atom
+                bond_type = bond.GetBondType()
+                if bond_type == Chem.BondType.SINGLE:
+                    bonding_type = "-"
+                elif bond_type == Chem.BondType.DOUBLE:
+                    bonding_type = "="
+                elif bond_type == Chem.BondType.TRIPLE:
+                    bonding_type = "#"
+                elif bond_type == Chem.BondType.AROMATIC:
+                    bonding_type = ':'
+                bond_tokens.append(bonding_type)
+
+            sort_order = {'-': 0, '=': 1, '#': 2, ':': 3}
+            bond_tokens = sorted(bond_tokens, key=lambda x: sort_order[x])
+            
+            atom_token = [atom_symbol]
+            for bond_token in bond_tokens:
+                atom_token.extend([0, bond_token])
+            atom_token = tuple(atom_token)
+            atom_tokens.add(atom_token)
+    
+    # Return unique atom tokens as a sorted list
+    return sorted(atom_tokens)
+
+
+def atom_tokens_sort(strings):
+    """
+    Sort atom tokens based on specific rules:
+    - Split strings into three parts using regular expressions.
+    - First part: Sorted using a custom sort order.
+    - Second part: Sorted based on atomic number (from element symbol).
+    - Third part: Sorted using custom order or alphabetically if not in order.
+    
+    Parameters:
+        strings (list): List of strings to sort.
+    
+    Returns:
+        list: Sorted list of strings.
+    """
+    # Custom sort order for specific characters
+    sort_order = {'-': 0, '=': 1, '#': 2, ':': 3}
+    
+    # Atomic number mapping for element symbols
+    atomic_number = {
+        'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10,
+        'Na': 11, 'Mg': 12, 'Al': 13, 'Si': 14, 'P': 15, 'S': 16, 'Cl': 17, 'Ar': 18,
+        # Add more elements as needed
+    }
+    
+    def sort_key(s):
+        # Use regex to split the string into three parts
+        symbol = atomic_number.get(s[0], float('inf'))
+        bonds = s[2::2]
+        bonds = [sort_order.get(b, float('inf')) for b in bonds]
+        
+        if len(bonds) < 4:
+            bonds += [-1] * (4 - len(bonds))
+        
+        return tuple([symbol]+bonds)
+    
+    # Sort the strings using the custom key
+    return sorted(strings, key=sort_key)
+
 
 class TimeoutException(Exception):
     """Custom exception for handling timeouts."""
@@ -195,21 +220,20 @@ def normalize_bond_info(bond_info):
     try:
         # Parse the molecular structure from the SMILES string
         mol = Chem.MolFromSmiles(bond_info[0])
-        degree = (len(bond_info) - 1) // 3  # Determine the number of bonds described
+        degree = (len(bond_info) - 1) // 2  # Determine the number of bonds described
         total_atoms = mol.GetNumAtoms()
 
         # Step 1: Identify target atom indices from the bond information
         tgt_atom_indices = []
         route_between_targets = {}
         for i in range(degree):
-            tgt_atom_indices.append(bond_info[3 * i + 1])
+            tgt_atom_indices.append(bond_info[2 * i + 1])
 
         # Step 2: Initialize dictionary to track equivalent atom indices
         equivalent_atom_indices = {}
         for i in range(degree):
-            atom_idx = bond_info[3 * i + 1]
-            bond_type = bond_info[3 * i + 2]
-            bond_order = bond_info[3 * i + 3]
+            atom_idx = bond_info[2 * i + 1]
+            bond_type = bond_info[2 * i + 2]
             
             # Traverse through neighboring atoms to map equivalent routes
             atom = mol.GetAtomWithIdx(atom_idx)
@@ -430,15 +454,70 @@ def normalize_bond_info(bond_info):
         final_bond_info = [bond_info[0]]
         temp = []
         for i, atom_idx in enumerate(success_pair):
-            temp.append([atom_idx, bond_info[3 * i + 2]])
+            temp.append([atom_idx, bond_info[2 * i + 2]])
         temp = sorted(temp, key=lambda x: x[0])
         for i, t in enumerate(temp):
             final_bond_info.append(t[0])
             final_bond_info.append(t[1])
-            final_bond_info.append(i + 1)
+            # final_bond_info.append(i + 1)
     except:
         final_bond_info = bond_info.copy()
     finally:
         signal.alarm(0)
 
     return final_bond_info
+
+
+
+def calculate_advanced_scores(smiles_or_mol: str):
+    """
+    Calculate advanced scores for each atom in a molecule based on:
+    - Symbol score (atomic type)
+    - Join type score (bond type)
+    - Distance from molecule center
+    """
+    if isinstance(smiles_or_mol, str):
+        mol = Chem.MolFromSmiles(smiles_or_mol)
+    elif isinstance(smiles_or_mol, Chem.Mol):
+        mol = smiles_or_mol
+    else:
+        raise ValueError("Invalid input type. Expected SMILES string or RDKit Mol object.")
+    
+    if mol is None:
+        raise ValueError(f"Invalid mol")
+
+    total_atoms = mol.GetNumAtoms()
+    distance_matrix = rdmolops.GetDistanceMatrix(mol)
+
+    # Updated symbol_scores with Carbon having the highest score
+    symbol_scores = {
+        "C": 2.0, "N": 1.5, "O": 1.4, "S": 1.3, "P": 1.2, 
+        "F": 1.1, "Cl": 1.0, "Br": 0.9, "I": 0.8, 
+        "Si": 0.7, "B": 0.6, "Li": 0.5, "Na": 0.4, 
+        "K": 0.3, "Mg": 0.2, "Ca": 0.1
+    }
+
+    bond_scores = {Chem.BondType.SINGLE: 1.0, Chem.BondType.DOUBLE: 1.5, Chem.BondType.TRIPLE: 2.0, Chem.BondType.AROMATIC: 2.5}
+
+    scores = []
+    for atom in mol.GetAtoms():
+        atom_idx = atom.GetIdx()
+        symbol = atom.GetSymbol()
+        if symbol == "H":  # Skip hydrogen
+            continue
+        max_distance = distance_matrix[atom_idx].max()  # Average distance
+        symbol_score = symbol_scores.get(symbol, 0.1)  # Default to minimum score for unknown atoms
+
+        # Calculate join type score
+        join_type_score = sum(
+            bond_scores.get(bond.GetBondType(), 0) for bond in atom.GetBonds()
+        )
+
+        # Calculate the final score
+        atom_score = sum(
+            ((max_distance - dist) / max_distance / join_type_score * symbol_score) / total_atoms
+            for dist in distance_matrix[atom_idx]
+        )
+        scores.append((atom_idx, symbol, atom_score))
+
+    return scores
