@@ -11,11 +11,11 @@ def main(args):
 
     suppl = None
     mols = []
-    if args.smiles_path.endswith('.sdf'):
+    if args.file_path.endswith('.sdf'):
         print("Reading Chem.Mol from SDF file")
-        suppl = Chem.SDMolSupplier(args.smiles_path)
+        suppl = Chem.SDMolSupplier(args.file_path)
     else:
-        all_smiles = read_smiles(args.smiles_path)
+        all_smiles = read_smiles(args.file_path)
         print("Number of SMILES entered: ", len(all_smiles))
         
         cou = 0
@@ -41,7 +41,7 @@ def main(args):
             raise ValueError("There might be some errors. Check your SMILES data.")
 
     # print("Process 2/9 is running", end = '...')
-    substruct_matcher = SubstructureMatcher()
+    fragmentizer = Fragmentizer()
     count_labels = Counter() #(substructureSMILES,(AtomIdx in substructure, join order)xN)->frequency of use of label
     # fragments = []
     atom_tokens = set()
@@ -53,7 +53,7 @@ def main(args):
 
     for i, m in iterator:
         try:
-            cl, frag, a_tokens = substruct_matcher.split_molecule_by_functional_groups(m)
+            cl, frag, a_tokens, fragment_atom_mapping = fragmentizer.split_molecule_by_functional_groups(m)
             count_labels.update(cl)
             # fragments.append(frag)
             atom_tokens.update(a_tokens)
@@ -81,17 +81,10 @@ if __name__ == "__main__":
     import argparse
     warnings.simplefilter('ignore')
     parser = argparse.ArgumentParser()
-    parser.add_argument('-f', "--smiles_path", type = str, required=True, help = "Path of SMILES data for input compounds (delete SMILES containing '.')")
+    parser.add_argument('-f', "--file_path", type = str, required=True, help = "Path of SMILES data for input compounds (delete SMILES containing '.')")
     parser.add_argument('-o', '--save_dir', type = str, required=True, help = "Path to save created data")
     parser.add_argument('--save_cnt_label', type = str, choices=['b', 't', 'bt', 'tb'], default = 'b', help = "Type of count label to save")
     parser.add_argument('--save_mol', action='store_true', help = "Save the created molecule data with RDKit")
-    # parser.add_argument("-freq", "--frequency", type = int, default = 5,
-    #                     help = "Threshold frequencies at decomposition")
-    # parser.add_argument("-fpbit", type = int, default = 2048,
-    #                     help = "Number of bits of ECFP")
-    # parser.add_argument("-r", "--radius", type = int, default = 2,
-    #                     help = "Effective radius of ECFP")
-    # parser.add_argument("--save_path", type = str,
-    #                     default = "./save_data", help = "Path to save created data")
+
     args = parser.parse_args()
     main(args)
