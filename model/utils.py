@@ -6,6 +6,7 @@ from rdkit.Chem import rdmolops
 from itertools import product, combinations, permutations
 from collections import Counter
 from collections import defaultdict
+from bidict import bidict
 import copy
 import numpy as np
 import torch
@@ -87,6 +88,19 @@ def chem_bond_to_token(bond_type):
         raise ValueError("Invalid bond type.")
     return bonding_type
 
+def token_to_chem_bond(token):
+    if token == "-":
+        bond_type = Chem.BondType.SINGLE
+    elif token == "=":
+        bond_type = Chem.BondType.DOUBLE
+    elif token == "#":
+        bond_type = Chem.BondType.TRIPLE
+    elif token == ":":
+        bond_type = Chem.BondType.AROMATIC
+    else:
+        raise ValueError("Invalid bond token.")
+    return bond_type
+
 #Mol->Mol (Error->None)
 def sanitize(mol, kekulize = True):
     try:
@@ -118,6 +132,462 @@ def add_Hs(rwmol, a1, a2, bond):
         rwmol.GetAtomWithIdx(new_idx).SetAtomMapNum(0)
         rwmol.AddBond(new_idx, a2.GetIdx(), Chem.BondType.SINGLE)
     return rwmol
+
+def remove_Hs(rwmol, a1, a2, bond_type):
+    try:
+        if str(bond_type) == 'SINGLE':
+            num = 1
+        elif str(bond_type) == 'DOUBLE':
+            num = 2
+        elif str(bond_type) == 'TRIPLE':
+            num = 3
+        elif str(bond_type) == 'AROMATIC':
+            print("error in remove_Hs 1")
+        else:
+            print("error in remove_Hs 2")
+    except:
+        if bond_type == 0:
+            num = 1
+        elif bond_type == 1:
+            num = 2
+        elif bond_type == 2:
+            num = 3
+        else:
+            raise
+    rwmol = Chem.AddHs(rwmol)
+    rwmol = Chem.RWMol(rwmol)
+    #Set hydrogen maps for connected atoms
+    h_map1 = 2000000
+    h_map2 = 3000000
+    f_h_map1 = copy.copy(h_map1)
+    f_h_map2 = copy.copy(h_map2)
+    for b in rwmol.GetBonds():
+        s_atom = b.GetBeginAtom()
+        e_atom = b.GetEndAtom()
+        if (e_atom.GetIdx() == a1.GetIdx()) and (s_atom.GetSymbol() == 'H'):
+            s_atom.SetAtomMapNum(h_map1)
+            h_map1 += 1
+        elif (s_atom.GetIdx() == a1.GetIdx()) and (e_atom.GetSymbol() == 'H'):
+            e_atom.SetAtomMapNum(h_map1)
+            h_map1 += 1
+        elif (e_atom.GetIdx() == a2.GetIdx()) and (s_atom.GetSymbol() == 'H'):
+            s_atom.SetAtomMapNum(h_map2)
+            h_map2 += 1
+        elif (s_atom.GetIdx() == a2.GetIdx()) and (e_atom.GetSymbol() == 'H'):
+            e_atom.SetAtomMapNum(h_map2)
+            h_map2 += 1
+    for i in range(num):
+        try:
+            for atom in rwmol.GetAtoms():
+                if atom.GetAtomMapNum() == f_h_map1 + i:
+                    rwmol.RemoveAtom(atom.GetIdx())
+                    break
+            for atom in rwmol.GetAtoms():
+                if atom.GetAtomMapNum() == f_h_map2 + i:
+                    rwmol.RemoveAtom(atom.GetIdx())
+                    break
+        except:
+            print("Remove Hs times Error!!")
+            raise
+    rwmol = rwmol.GetMol()
+    rwmol = sanitize(rwmol, kekulize = False)
+    rwmol = Chem.RemoveHs(rwmol)
+    rwmol = Chem.RWMol(rwmol)
+    return rwmol
+
+def split_fragment_info(frag_info, cut_bond_indices, ori_atom_indices):
+    """
+    Break bonds at specified atom indices and generate new frag_info for resulting fragments.
+    
+    Parameters:
+        frag_info (tuple): The original fragment information, e.g., ('CC(C)CCCCCCOC(=O)', 0, '-', 10, '-').
+        bond_indices (list of tuples): Pairs of atom indices to break bonds (e.g., [(1, 3)]).
+    
+    Returns:
+        list of tuples: New frag_info for each resulting fragment.
+    """
+    # Extract the SMILES string from frag_info
+    smiles = frag_info[0]
+
+    # Convert SMILES to Mol object
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError("Invalid SMILES string in frag_info.")
+    mol = Chem.rdmolops.RemoveHs(mol)
+    
+    # Create editable version of the molecule
+    new_mol = Chem.RWMol(mol)
+
+    for atom in new_mol.GetAtoms():
+        atom.SetAtomMapNum(atom.GetIdx())
+    
+    # Break specified bonds
+    bond_types = {}
+    for idx1, idx2 in cut_bond_indices:
+        if new_mol.GetBondBetweenAtoms(idx1, idx2) is not None:
+            atom1 = new_mol.GetAtomWithIdx(idx1)
+            atom2 = new_mol.GetAtomWithIdx(idx2)
+            bond = new_mol.GetBondBetweenAtoms(idx1, idx2)
+            new_mol = add_Hs(new_mol, atom1, atom2, bond)  # Add hydrogens to adjust valence
+            new_mol.RemoveBond(atom1.GetIdx(), atom2.GetIdx())
+            if idx1 < idx2:
+                bond_types[(idx1, idx2)] = chem_bond_to_token(bond.GetBondType())
+            else:
+                bond_types[(idx2, idx1)] = chem_bond_to_token(bond.GetBondType())
+        else:
+            raise ValueError(f"No bond found between atom indices {idx1} and {idx2}.")
+    
+    # Generate new fragment information for each resulting fragment
+    new_mol = new_mol.GetMol()
+    new_mol = sanitize(new_mol, kekulize = False)
+    new_smiles = Chem.MolToSmiles(new_mol)
+    fragment_mols = [Chem.MolFromSmiles(fragment) for fragment in new_smiles.split('.')]
+    fragment_mols = [sanitize(fragment, kekulize = False) for fragment in fragment_mols]
+
+    frag_infoes = []
+    atom_dicts = {}
+    bond_poses_dict = defaultdict(lambda: defaultdict(list))
+    for frag_idx, frag_mol in enumerate(fragment_mols):
+        
+        atom_dict = {}
+        for i, atom in enumerate(frag_mol.GetAtoms()):
+            amap = atom.GetAtomMapNum()
+            atom_dict[amap] = i
+            
+        for atom in frag_mol.GetAtoms():
+            frag_mol.GetAtomWithIdx(atom.GetIdx()).SetAtomMapNum(0)
+
+        frag_smi = Chem.MolToSmiles(frag_mol)
+        atom_order = list(map(int, frag_mol.GetProp('_smilesAtomOutputOrder')[1:-2].split(",")))
+
+        for key in atom_dict:
+            atom_dict[key] = atom_order.index(atom_dict[key])
+        
+        bond_infoes = []
+        for i in range(1, len(frag_info), 2):
+            if frag_info[i] in atom_dict:
+                bond_infoes.append([atom_dict[frag_info[i]], frag_info[i+1]])
+        for (idx1, idx2) in cut_bond_indices:
+            if idx1 in atom_dict:
+                idx = idx1
+            elif idx2 in atom_dict:
+                idx = idx2
+            else:
+                continue
+            
+            bond_type = bond_types.get((idx1, idx2), bond_types.get((idx2, idx1)))
+            bond_infoes.append([atom_dict[idx], bond_type])
+        bond_infoes = sorted(bond_infoes, key = lambda x: x[0])
+
+        new_frag_info = [frag_smi]
+        for i in range(len(bond_infoes)):
+            new_frag_info.append(bond_infoes[i][0])
+            new_frag_info.append(bond_infoes[i][1])
+            bond_poses_dict[frag_idx][(bond_infoes[i][0], bond_infoes[i][1])].append(i)
+        frag_infoes.append([tuple(new_frag_info), []])
+        atom_dicts[frag_idx] = atom_dict
+    
+    for (bond_idx1, bond_idx2) in cut_bond_indices:
+        for frag_idx, atom_dict in atom_dicts.items():
+            if bond_idx1 in atom_dict:
+                bond_i1 = atom_dict[bond_idx1]
+                frag_idx1 = frag_idx
+            if bond_idx2 in atom_dict:
+                bond_i2 = atom_dict[bond_idx2]
+                frag_idx2 = frag_idx
+        bond = mol.GetBondBetweenAtoms(bond_idx1, bond_idx2)
+        bond_type = chem_bond_to_token(bond.GetBondType())
+        frag_infoes[frag_idx1][1].append((bond_poses_dict[frag_idx1][(bond_i1, bond_type)][0], (frag_idx2, bond_poses_dict[frag_idx2][(bond_i2, bond_type)][0])))
+        frag_infoes[frag_idx2][1].append((bond_poses_dict[frag_idx2][(bond_i2, bond_type)].pop(0), (frag_idx1, bond_poses_dict[frag_idx1][(bond_i1, bond_type)].pop(0))))
+    
+    for i in range(len(frag_infoes)):
+        frag_infoes[i][1] = sorted(frag_infoes[i][1], key = lambda x: x[0])
+
+    normalize_bond_dict = defaultdict(dict)
+    normalize_frag_infoes = []
+    final_atom_maps = {}
+    for frag_idx, frag_mol in enumerate(fragment_mols):
+        frag_info = frag_infoes[frag_idx][0]
+        new_frag_info, atom_maps = normalize_bond_info(frag_info, list(range(frag_mol.GetNumAtoms())))
+        normalize_frag_infoes.append([new_frag_info, []])
+        for global_atom_i, pre_frag_atom_i in atom_dicts[frag_idx].items():
+            final_atom_maps[ori_atom_indices[global_atom_i]] = (frag_idx, atom_maps.index(pre_frag_atom_i))
+        new_bond_dict = defaultdict(list)
+        for i, (new_atom_idx, bond_type) in enumerate(zip(new_frag_info[1::2], new_frag_info[2::2])):
+            new_bond_dict[(new_atom_idx, bond_type)].append(i)
+        for i, pre_atom_idx in enumerate(frag_info[1::2]):
+            normalize_bond_dict[frag_idx][i] = new_bond_dict[(atom_maps.index(pre_atom_idx), frag_info[2*i+2])].pop(0)
+
+    for frag_idx, frag_info in enumerate(frag_infoes):
+        for bond_pos, (to_frag_idx, to_bond_pos) in frag_info[1]:
+            normalize_frag_infoes[frag_idx][1].append((normalize_bond_dict[frag_idx][bond_pos], (to_frag_idx, normalize_bond_dict[to_frag_idx][to_bond_pos])))
+        
+    return normalize_frag_infoes, final_atom_maps
+
+def merge_fragment_info(frag_infoes, merge_bond_poses, atom_id_list = None):
+    """
+    Merge multiple molecular fragments into a single molecule by combining and bonding them.
+    
+    Args:
+        frag_infoes (list of tuples): Each tuple contains fragment information. 
+            The first element is the SMILES string of the fragment. Subsequent elements are:
+            (smiles, atom_idx1, bond_type1, atom_idx2, bond_type2, ...)
+                - The atom indices involved in bonds
+                - The bond types (e.g., '-', '=', etc.)
+        merge_bond_poses (list of tuples): Specifies the bonds to be created between fragments.
+            Each tuple contains:
+            ((frag_idx1, bond_pos1), bond_type, (frag_idx2, bond_pos2))
+                - Position of the first fragment and its bond index
+                - Bond type (e.g., '-', '=', etc.)
+                - Position of the second fragment and its bond index
+        atom_id_list (list of lists, optional): Maps fragment atom indices to global atom IDs.
+            If not provided, default indices [0, 1, ..., N] are used for each fragment.
+
+    Returns:
+        tuple: A tuple containing:
+            - final_frag_info (tuple): The SMILES string of the combined molecule and bond information.
+            - final_atom_map (bidict): Maps global atom indices in the combined molecule to fragment indices and atom IDs.
+    """
+
+    # Convert SMILES to RDKit molecules for each fragment
+    mols = [Chem.MolFromSmiles(frag_info[0]) for frag_info in frag_infoes]
+
+    # If no atom_id_list is provided, use default atom indices for each fragment
+    if atom_id_list is None:
+        atom_id_list = [list(range(mol.GetNumAtoms())) for mol in mols]
+
+    # Initialize atom mapping and remaining bond positions
+    atom_map = bidict()
+    remaining_bond_poses = []
+    offset = 0
+
+    # Combine molecules and assign atom map numbers
+    for i, mol in enumerate(mols):
+        for atom in mol.GetAtoms():
+            atom_idx = atom.GetIdx()
+            atom.SetAtomMapNum(atom_idx + offset)  # Assign unique atom map numbers
+            atom_map[atom.GetIdx() + offset] = (i, atom_idx)
+            
+        if i == 0:
+            combined_mol = copy.deepcopy(mol)  # Start with the first fragment
+        else:
+            combined_mol = Chem.CombineMols(combined_mol, mol)  # Add subsequent fragments
+
+        # Track remaining bonds in the fragment
+        for j in range((len(frag_infoes[i]) - 1) // 2):
+            remaining_bond_poses.append((i, j))
+        offset += mol.GetNumAtoms()  # Update offset for the next fragment
+
+    # Convert the combined molecule to an editable RWMol
+    combined_rwmol = Chem.RWMol(combined_mol)
+
+    # Add specified bonds between fragments
+    for i, (joint_pos1, bond_type, joint_pos2) in enumerate(merge_bond_poses):
+        frag_idx1, bond_pos1 = joint_pos1
+        map_number1 = atom_map.inv[(frag_idx1, frag_infoes[frag_idx1][2 * bond_pos1 + 1])]
+
+        frag_idx2, bond_pos2 = joint_pos2
+        map_number2 = atom_map.inv[(frag_idx2, frag_infoes[frag_idx2][2 * bond_pos2 + 1])]
+
+        # Find atom indices by map number
+        atom_idx1 = next(atom.GetIdx() for atom in combined_rwmol.GetAtoms() if atom.GetAtomMapNum() == map_number1)
+        atom_idx2 = next(atom.GetIdx() for atom in combined_rwmol.GetAtoms() if atom.GetAtomMapNum() == map_number2)
+
+        atom1 = combined_rwmol.GetAtomWithIdx(atom_idx1)
+        atom2 = combined_rwmol.GetAtomWithIdx(atom_idx2)
+        bond_type = token_to_chem_bond(bond_type)  # Convert bond type to RDKit format
+        combined_rwmol.AddBond(atom_idx1, atom_idx2, bond_type)  # Add bond
+        combined_rwmol = remove_Hs(combined_rwmol, atom1, atom2, bond_type)  # Remove hydrogens
+        remaining_bond_poses.remove((frag_idx1, bond_pos1))
+        remaining_bond_poses.remove((frag_idx2, bond_pos2))
+
+    # Generate the final combined molecule and SMILES
+    combined_mol = combined_rwmol.GetMol()
+    atom_map2 = bidict()
+    for i, atom in enumerate(combined_mol.GetAtoms()):
+        atom_map2[i] = atom_map[atom.GetAtomMapNum()]
+    for atom in combined_mol.GetAtoms():
+        atom.SetAtomMapNum(0)
+    smiles = Chem.MolToSmiles(combined_mol, isomericSmiles=True)
+
+    # Extract atom order from SMILES
+    atom_order = list(map(int, combined_mol.GetProp('_smilesAtomOutputOrder')[1:-2].split(",")))
+
+    new_atom_maps = bidict({i: atom_map2[order] for i, order in enumerate(atom_order)})
+
+    # Map new atom indices to original fragments and atom IDs
+    # new_atom_maps = bidict()
+    # for i, pre_atom_idx in enumerate(atom_order):
+    #     frag_idx, atom_idx = atom_map[pre_atom_idx]
+    #     new_atom_maps[i] = (frag_idx, atom_id_list[frag_idx][atom_idx])
+
+    # Collect remaining bond information
+    bond_infoes = []
+    for frag_idx, bond_pos in remaining_bond_poses:
+        atom_idx = frag_infoes[frag_idx][2 * bond_pos + 1]
+        bond_type = frag_infoes[frag_idx][2 * bond_pos + 2]
+        bond_infoes.append((atom_map.inv[(frag_idx, atom_id_list[frag_idx][atom_idx])], bond_type))
+
+    # Create the new fragment information
+    new_frag_info = [smiles]
+    for bond_info in bond_infoes:
+        new_frag_info.extend(bond_info)
+    new_frag_info = tuple(new_frag_info)
+
+    # Normalize bond information
+    final_frag_info, new_atom_indices = normalize_bond_info(new_frag_info, list(range(len(new_atom_maps))))
+
+    # Create the final atom map
+    final_atom_map = bidict()
+    for i, atom_idx in enumerate(new_atom_indices):
+        final_atom_map[i] = new_atom_maps[atom_idx]
+
+    return final_frag_info, final_atom_map
+    
+        
+def match_fragment(tgt_frag_info, tgt_start_pos, qry_frag_info, qry_start_pos):
+    tgt_mol = Chem.MolFromSmiles(tgt_frag_info[0])
+    qry_mol = Chem.MolFromSmiles(qry_frag_info[0])
+    tgt_bond_infoes = [(bond_idx, bond_type) for bond_idx, bond_type in zip(tgt_frag_info[1::2], tgt_frag_info[2::2])]
+
+    qry_bond_infoes = [(bond_idx, bond_type) for bond_idx, bond_type in zip(qry_frag_info[1::2], qry_frag_info[2::2])]
+
+
+    if tgt_bond_infoes[tgt_start_pos][1] != qry_bond_infoes[qry_start_pos][1]:
+        return None
+
+    qry_route_trees = build_route_tree(qry_frag_info, qry_start_pos, mol=qry_mol)
+    max_route = max([len(x['idx']) for x in qry_route_trees])
+    tgt_route_trees = build_route_tree(tgt_frag_info, tgt_start_pos, mol=tgt_mol, options={'max_route': max_route})
+
+    qry_route_trees = sorted(qry_route_trees, key = lambda x: "_".join(x['route']), reverse = True)
+    qry_route_strs = ["_".join(x['route']) for x in qry_route_trees]
+    tgt_route_trees = sorted(tgt_route_trees, key = lambda x: "_".join(x['route']), reverse = True)
+    tgt_route_strs = ["_".join(x['route']) for x in tgt_route_trees]
+    
+    route_pair = defaultdict(list)
+    nj = 0
+    for i, qry_route_tree in enumerate(qry_route_trees):
+        j = nj
+        while j < len(tgt_route_trees):
+            if qry_route_strs[i] > tgt_route_strs[j]:
+                nj = j
+                break
+            if qry_route_strs[i] == tgt_route_strs[j]:
+                route_pair[i].append(j)
+            j += 1
+    
+    if len(qry_route_strs) != len(route_pair):
+        return None
+    
+    atom_idx_dicts = []
+    for qry_route_idx, tgt_route_indices in route_pair.items():
+        qry_route_tree = qry_route_trees[qry_route_idx]
+        if len(atom_idx_dicts) == 0:
+            for tgt_route_idx in tgt_route_indices:
+                atom_idx_dict = {qry_atom_idx: tgt_atom_idx for qry_atom_idx, tgt_atom_idx in zip(qry_route_tree['idx'], tgt_route_trees[tgt_route_idx]['idx'])}
+                atom_idx_dicts.append(atom_idx_dict)
+        else:
+            new_atom_idx_dicts = []
+            for atom_idx_dict in atom_idx_dicts:
+                for tgt_route_idx in tgt_route_indices:
+                    tmp_atom_idx_dict = copy.deepcopy(atom_idx_dict)
+                    for qry_atom_idx, tgt_atom_idx in zip(qry_route_tree['idx'], tgt_route_trees[tgt_route_idx]['idx']):
+                        if qry_atom_idx in tmp_atom_idx_dict and tmp_atom_idx_dict[qry_atom_idx] != tgt_atom_idx:
+                            break
+                        tmp_atom_idx_dict[qry_atom_idx] = tgt_atom_idx
+                    else:
+                        new_atom_idx_dicts.append(tmp_atom_idx_dict)
+            atom_idx_dicts = new_atom_idx_dicts
+
+        if len(atom_idx_dicts) == 0:
+            break
+
+    if len(atom_idx_dicts) == 0:
+        return None
+
+    return atom_idx_dicts[0]
+
+
+def build_route_tree(frag_info, start_bond_pos, mol=None, options=None):
+    if mol is None:
+        mol = Chem.MolFromSmiles(frag_info[0])
+    
+    if options is not None and 'max_route' in options:
+        max_route = options['max_route']
+    else:
+        max_route = float('inf')
+        
+    bond_infoes = [(bond_idx, bond_type) for bond_idx, bond_type in zip(frag_info[1::2], frag_info[2::2])]
+    frag_info_dict = defaultdict(list)
+    for i in range(len(bond_infoes)):
+        frag_info_dict[bond_infoes[i][0]].append(i)
+    
+    visited = set()
+    completed_routes = []
+    start_atom_idx = bond_infoes[start_bond_pos][0]
+    start_atom = mol.GetAtomWithIdx(start_atom_idx)
+    current_routes = [{'idx': [start_atom_idx], 'route': []}]
+    current_routes[0]['route'].append(bond_infoes[start_bond_pos][1])
+    current_routes[0]['route'].append(start_atom.GetSymbol())
+    visited.add(bond_infoes[start_bond_pos][0])
+    for i, bond_info in enumerate(bond_infoes):
+        if i == start_bond_pos:
+            continue
+        if bond_info[0] == start_atom_idx:
+            route = copy.deepcopy(current_routes[0])
+            route['route'].append(bond_info[1])
+            completed_routes.append(route)
+
+    if len(visited) == mol.GetNumAtoms():
+        if len(completed_routes) == 0: # -O などの1つの原子で続きの結合がない場合 
+            completed_routes.append(current_routes[0])
+        next_routes = []
+        current_routes = []
+    
+    route_cnt = 1
+    while len(current_routes) > 0:
+        next_routes = []
+        for i, current_route in enumerate(reversed(current_routes)):
+            current_atom = mol.GetAtomWithIdx(current_route['idx'][-1])
+            neighbors = [neighbor for neighbor in current_atom.GetNeighbors() if neighbor.GetIdx() not in visited]
+
+            if len(neighbors) == 0:
+                if len(current_route['route']) % 2 == 0: # -C-C などの続きの結合がない場合
+                    completed_routes.append(current_route)
+                continue
+
+            for neighbor in neighbors:
+                neighbor_idx = neighbor.GetIdx()
+                visited.add(neighbor_idx)
+                new_route = copy.deepcopy(current_route)
+                bond = mol.GetBondBetweenAtoms(current_route['idx'][-1], neighbor_idx)
+                bond_type = chem_bond_to_token(bond.GetBondType())
+                new_route['route'].append(bond_type)
+                if route_cnt < max_route:
+                    new_route['idx'].append(neighbor_idx)
+                    new_route['route'].append(neighbor.GetSymbol())
+                
+                    for i, bond_info in enumerate(bond_infoes):
+                        if neighbor_idx != bond_info[0]:
+                            continue
+                        route = new_route.copy()
+                        route['route'].append(bond_info[1])
+                        completed_routes.append(route)
+                
+                next_routes.append(new_route)
+
+        current_routes = next_routes
+        route_cnt += 1
+        if route_cnt > max_route:
+            break
+
+    
+    for current_route in current_routes:
+        completed_routes.append(current_route)
+    
+    return completed_routes
+    
 
 def get_atom_tokens(mol):
     """
@@ -209,314 +679,29 @@ def timeout_handler(signum, frame):
     """Signal handler for timeout."""
     raise TimeoutException("Function execution timed out.")
 
-# def normalize_bond_info(bond_info, frag_atom_indices):
-#     """
-#     Normalize the bond information by mapping atom indices based on SMILES output order.
-#     This ensures equivalent representation of atom indices and bonds for comparison.
-    
-#     Parameters:
-#         bond_info (tuple): A tuple containing SMILES string, atom indices, bond types, and bond orders.
-    
-#     Returns:
-#         list: Normalized bond information where equivalent bonds are assigned consistent indices.
-#     """
-#     signal.signal(signal.SIGALRM, timeout_handler)
-#     # signal.alarm(10)
-
-#     try:
-#         # Parse the molecular structure from the SMILES string
-#         mol = Chem.MolFromSmiles(bond_info[0])
-#         degree = (len(bond_info) - 1) // 2  # Determine the number of bonds described
-#         total_atoms = mol.GetNumAtoms()
-
-#         # Step 1: Identify target atom indices from the bond information
-#         tgt_atom_indices = []
-#         route_between_targets = {}
-#         for i in range(degree):
-#             tgt_atom_indices.append(bond_info[2 * i + 1])
-
-#         # Step 2: Initialize dictionary to track equivalent atom indices
-#         equivalent_atom_indices = {}
-#         for i in range(degree):
-#             atom_idx = bond_info[2 * i + 1]
-#             bond_type = bond_info[2 * i + 2]
-            
-#             # Traverse through neighboring atoms to map equivalent routes
-#             atom = mol.GetAtomWithIdx(atom_idx)
-#             neighbor_level = 1
-#             neighbor_routes = {0: ['']}
-#             atom_position = {atom_idx: [0, 0]}  # Initialize atom positions
-#             next_atoms_to_explore = [atom_idx]
-#             route_between_targets[(atom_idx, atom_idx)] = ''
-
-#             # Continue traversal until all atoms are mapped
-#             while len(atom_position) < total_atoms:
-#                 temp_atom_positions = {}
-#                 temp_neighbor_routes = []
-#                 for current_idx in next_atoms_to_explore:
-#                     current_atom = mol.GetAtomWithIdx(current_idx)
-#                     for neighbor in current_atom.GetNeighbors():
-#                         neighbor_idx = neighbor.GetIdx()  # Get the neighbor atom's index
-#                         if neighbor_idx in atom_position:
-#                             continue
-#                         neighbor_symbol = neighbor.GetSymbol()  # Get the neighbor atom's symbol
-#                         bond = mol.GetBondBetweenAtoms(current_idx, neighbor_idx)  # Get the bond object
-#                         bond_type = bond.GetBondType()  # Get the bond type
-
-#                         # Map bond type to a numerical representation
-#                         if bond_type == Chem.BondType.SINGLE:
-#                             bond_type_num = 0
-#                         elif bond_type == Chem.BondType.DOUBLE:
-#                             bond_type_num = 1
-#                         elif bond_type == Chem.BondType.TRIPLE:
-#                             bond_type_num = 2
-#                         elif bond_type == Chem.BondType.AROMATIC:
-#                             bond_type_num = 3
-#                         else:
-#                             raise ValueError("Invalid bond type.")
-                        
-#                         # Build a route string based on bond type and atom symbol
-#                         prev_level, prev_list_idx = atom_position[current_idx]
-#                         route_str = neighbor_routes[prev_level][prev_list_idx] + f'_{bond_type_num}_{neighbor_symbol}'
-
-#                         # Update positions and routes for the neighbor atom
-#                         if neighbor_idx not in temp_atom_positions:
-#                             temp_atom_positions[neighbor_idx] = len(temp_neighbor_routes)
-#                             temp_neighbor_routes.append(route_str)
-#                         else:
-#                             if route_str < temp_neighbor_routes[temp_atom_positions[neighbor_idx]]:
-#                                 temp_atom_positions[neighbor_idx] = len(temp_neighbor_routes)
-#                             temp_neighbor_routes.append(route_str)
-#                 neighbor_routes[neighbor_level] = temp_neighbor_routes.copy()
-#                 for neighbor_idx, list_idx in temp_atom_positions.items():
-#                     atom_position[neighbor_idx] = [neighbor_level, list_idx]
-#                     if neighbor_idx in tgt_atom_indices:
-#                         route_between_targets[(atom_idx, neighbor_idx)] = temp_neighbor_routes[list_idx]
-#                 next_atoms_to_explore = list(temp_atom_positions.keys())
-#                 neighbor_level += 1
-
-#             # Step 3: Compare routes to determine equivalence
-#             reference_routes = []
-#             for level in range(max(neighbor_routes.keys())+1):
-#                 reference_routes.append('+'.join(sorted(neighbor_routes[level])))
-            
-#             candidate_atom_indices = [i for i in range(total_atoms) if i != atom_idx]
-
-#             # Check if candidate atoms have equivalent routes to the reference
-#             for candi_atom_idx in reversed(candidate_atom_indices):
-#                 atom = mol.GetAtomWithIdx(candi_atom_idx)
-#                 neighbor_level = 1
-#                 neighbor_routes = {0: ['']}
-#                 atom_position = {candi_atom_idx: [0, 0]}
-#                 next_atoms_to_explore = [candi_atom_idx]
-
-#                 while len(atom_position) < total_atoms and candi_atom_idx in candidate_atom_indices:
-#                     temp_atom_positions = {}
-#                     temp_neighbor_routes = []
-#                     for current_idx in next_atoms_to_explore:
-#                         current_atom = mol.GetAtomWithIdx(current_idx)
-#                         for neighbor in current_atom.GetNeighbors():
-#                             neighbor_idx = neighbor.GetIdx()
-#                             if neighbor_idx in atom_position:
-#                                 continue
-#                             neighbor_symbol = neighbor.GetSymbol()
-#                             bond = mol.GetBondBetweenAtoms(current_idx, neighbor_idx)
-#                             bond_type = bond.GetBondType()
-
-#                             # Map bond type to numerical representation
-#                             if bond_type == Chem.BondType.SINGLE:
-#                                 bond_type_num = 0
-#                             elif bond_type == Chem.BondType.DOUBLE:
-#                                 bond_type_num = 1
-#                             elif bond_type == Chem.BondType.TRIPLE:
-#                                 bond_type_num = 2
-#                             elif bond_type == Chem.BondType.AROMATIC:
-#                                 bond_type_num = 3
-#                             else:
-#                                 raise ValueError("Invalid bond type.")
-                            
-#                             # Build a route string
-#                             prev_level, prev_list_idx = atom_position[current_idx]
-#                             route_str = neighbor_routes[prev_level][prev_list_idx] + f'_{bond_type_num}_{neighbor_symbol}'
-
-#                             # Update positions and routes
-#                             if neighbor_idx not in temp_atom_positions:
-#                                 temp_atom_positions[neighbor_idx] = len(temp_neighbor_routes)
-#                                 temp_neighbor_routes.append(route_str)
-#                             else:
-#                                 if route_str < temp_neighbor_routes[temp_atom_positions[neighbor_idx]]:
-#                                     temp_atom_positions[neighbor_idx] = len(temp_neighbor_routes)
-#                                 temp_neighbor_routes.append(route_str)
-#                     neighbor_routes[neighbor_level] = temp_neighbor_routes.copy()
-#                     candi_route_str = '+'.join(sorted(neighbor_routes[neighbor_level]))
-#                     if candi_route_str != reference_routes[neighbor_level]:
-#                         candidate_atom_indices.remove(candi_atom_idx)
-#                         break
-#                     for neighbor_idx, list_idx in temp_atom_positions.items():
-#                         atom_position[neighbor_idx] = [neighbor_level, list_idx]
-#                     next_atoms_to_explore = list(temp_atom_positions.keys())
-#                     neighbor_level += 1
-            
-#             equivalent_atom_indices[atom_idx] = candidate_atom_indices
-        
-#         # Step 4: Generate normalized bond information
-#         pos_indices = {}
-#         routes = route_between_targets.copy()
-#         for atom_idx, indices in equivalent_atom_indices.items():
-#             pos_indices[atom_idx] = [atom_idx] + indices
-
-#         total_indices = []
-#         for values in pos_indices.values():
-#             total_indices += values
-#         total_indices = list(set(total_indices))
-
-#         combs_cnt = 1
-#         for values in pos_indices.values():
-#             combs_cnt *= len(values)
-#             if combs_cnt > 10000:
-#                 raise ValueError("Too many combinations.")
-
-
-#         combs = list(product(*[arr for arr in pos_indices.values()]))
-#         combs = sorted(combs, key=lambda x: sorted(x))
-        
-#         success_pair = tgt_atom_indices.copy()
-#         for comb in combs:
-#             all_pairs = list(combinations(comb, 2))
-#             all_idx_pairs = list(combinations(range(len(comb)), 2))
-#             success = False
-#             for i, pair in enumerate(all_pairs):
-#                 # Register routes if not already present
-#                 if pair not in routes:
-#                     atom_idx = pair[0]
-#                     tgt_atom_idx = pair[1]
-#                     atom = mol.GetAtomWithIdx(atom_idx)
-#                     neighbor_level = 1
-#                     neighbor_routes = {0: ['']}
-#                     atom_position = {atom_idx: [0, 0]}
-#                     next_atoms_to_explore = [atom_idx]
-#                     routes[(atom_idx, atom_idx)] = ''
-#                     routes[(tgt_atom_idx, tgt_atom_idx)] = ''
-
-#                     while len(atom_position) < total_atoms:
-#                         temp_atom_positions = {}
-#                         temp_neighbor_routes = []
-#                         for current_idx in next_atoms_to_explore:
-#                             current_atom = mol.GetAtomWithIdx(current_idx)
-#                             for neighbor in current_atom.GetNeighbors():
-#                                 neighbor_idx = neighbor.GetIdx()
-#                                 if neighbor_idx in atom_position:
-#                                     continue
-#                                 neighbor_symbol = neighbor.GetSymbol()
-#                                 bond = mol.GetBondBetweenAtoms(current_idx, neighbor_idx)
-#                                 bond_type = bond.GetBondType()
-
-#                                 # Map bond type to numerical representation
-#                                 if bond_type == Chem.BondType.SINGLE:
-#                                     bond_type_num = 0
-#                                 elif bond_type == Chem.BondType.DOUBLE:
-#                                     bond_type_num = 1
-#                                 elif bond_type == Chem.BondType.TRIPLE:
-#                                     bond_type_num = 2
-#                                 elif bond_type == Chem.BondType.AROMATIC:
-#                                     bond_type_num = 3
-#                                 else:
-#                                     raise ValueError("Invalid bond type.")
-                                
-#                                 # Build a route string
-#                                 prev_level, prev_list_idx = atom_position[current_idx]
-#                                 route_str = neighbor_routes[prev_level][prev_list_idx] + f'_{bond_type_num}_{neighbor_symbol}'
-
-#                                 # Update positions and routes
-#                                 if neighbor_idx not in temp_atom_positions:
-#                                     temp_atom_positions[neighbor_idx] = len(temp_neighbor_routes)
-#                                     temp_neighbor_routes.append(route_str)
-#                                 else:
-#                                     if route_str < temp_neighbor_routes[temp_atom_positions[neighbor_idx]]:
-#                                         temp_atom_positions[neighbor_idx] = len(temp_neighbor_routes)
-#                                     temp_neighbor_routes.append(route_str)
-#                         neighbor_routes[neighbor_level] = temp_neighbor_routes.copy()
-#                         for neighbor_idx, list_idx in temp_atom_positions.items():
-#                             atom_position[neighbor_idx] = [neighbor_level, list_idx]
-#                             if neighbor_idx in total_indices:
-#                                 routes[(atom_idx, neighbor_idx)] = temp_neighbor_routes[list_idx]
-#                                 routes[(neighbor_idx, atom_idx)] = temp_neighbor_routes[list_idx]
-#                         next_atoms_to_explore = list(temp_atom_positions.keys())
-#                         neighbor_level += 1
-
-#                 tgt_route_str1 = routes[tgt_atom_indices[all_idx_pairs[i][0]], tgt_atom_indices[all_idx_pairs[i][1]]]
-#                 tgt_route_str2 = routes[tgt_atom_indices[all_idx_pairs[i][1]], tgt_atom_indices[all_idx_pairs[i][0]]]
-#                 route_str = routes[pair]
-#                 if route_str == tgt_route_str1 or route_str == tgt_route_str2:
-#                     continue
-#                 else:
-#                     break
-#             else:
-#                 success = True
-#                 success_pair = comb
-#                 break
-
-#         # Prepare final bond information
-#         final_bond_info = [bond_info[0]]
-#         change_map = {}
-#         temp = []
-#         for i, atom_idx in enumerate(success_pair):
-#             temp.append([atom_idx, bond_info[2 * i + 2]])
-#             change_map[bond_info[2 * i + 1]] = atom_idx
-#         temp = sorted(temp, key=lambda x: x[0])
-#         for i, t in enumerate(temp):
-#             final_bond_info.append(t[0])
-#             final_bond_info.append(t[1])
-#             # final_bond_info.append(i + 1)
-#     except:
-#         final_bond_info = bond_info.copy()
-#         final_atom_indices = frag_atom_indices.copy()
-#         return final_bond_info, final_atom_indices
-#     finally:
-#         signal.alarm(0)
-
-
-#     # Prepare fragment atom indices
-#     # Compute the adjacency matrix of the molecule
-#     adjacency_matrix = Chem.GetAdjacencyMatrix(mol)
-    
-#     # Use Floyd-Warshall algorithm to calculate shortest distances
-#     num_atoms = mol.GetNumAtoms()
-#     distance_matrix = np.full((num_atoms, num_atoms), float('inf'))
-#     np.fill_diagonal(distance_matrix, 0)  # Distance from atom to itself is 0
-    
-#     # Set initial distances based on bonds (adjacency matrix)
-#     for i in range(num_atoms):
-#         for j in range(num_atoms):
-#             if adjacency_matrix[i, j]:
-#                 distance_matrix[i, j] = 1  # Direct bond distance is 1
-    
-#     # Floyd-Warshall algorithm to compute shortest paths
-#     for k in range(num_atoms):
-#         for i in range(num_atoms):
-#             for j in range(num_atoms):
-#                 distance_matrix[i, j] = min(
-#                     distance_matrix[i, j], distance_matrix[i, k] + distance_matrix[k, j]
-#                 )
-
-#     return final_bond_info, frag_atom_indices
-
-
-def normalize_bond_info(bond_info, frag_atom_indices):
+def normalize_bond_info(bond_info, frag_atom_indices, timeout_seconds=10):
     """
-    Normalize the bond information by mapping atom indices based on SMILES output order.
-    This ensures equivalent representation of atom indices and bonds for comparison.
+    Normalize the bond information with a time limit.
+    If the processing time exceeds the limit, return the bond_info with an error message.
     
     Parameters:
-        bond_info (tuple): A tuple containing SMILES string, atom indices, bond types, and bond orders.
+        bond_info (tuple): The bond information to normalize.
+        frag_atom_indices (list): Atom indices for the fragment.
+        timeout_seconds (int): The maximum allowed time in seconds.
     
     Returns:
-        list: Normalized bond information where equivalent bonds are assigned consistent indices.
+        tuple: Normalized bond_info and atom indices or the original bond_info with an error message if timed out.
     """
+    sort_order = {'-': 0, '=': 1, '#': 2, ':': 3}
     signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(10)
+    # signal.alarm(timeout_seconds)
+
+    sort_order = {'-': 0, '=': 1, '#': 2, ':': 3}
 
     try:
+        if len(bond_info) == 1:
+            return bond_info, frag_atom_indices
+
         mol = Chem.MolFromSmiles(bond_info[0])
         total_atoms = mol.GetNumAtoms()
 
@@ -535,7 +720,16 @@ def normalize_bond_info(bond_info, frag_atom_indices):
         for i in range(degree):
             bond_infoes.append([bond_info[2 * i + 1], bond_info[2 * i + 2]])
 
+        if total_atoms == 1:
+            # bond_infoes = sorted(bond_infoes, key = lambda x: sorted(x[1]))
+            final_bond_info = [bond_info[0]]
+            bond_infoes = sorted(bond_infoes, key = lambda x: sort_order.get(x[1], float('inf')))
+            for bond_info in bond_infoes:
+                final_bond_info.extend(bond_info)
+            new_atom_indices = frag_atom_indices.copy()
+            return tuple(final_bond_info), new_atom_indices
 
+        route_matrix[0][0] = [[str(0)]]
         for bond in mol.GetBonds():
             bond_type = bond.GetBondType()
             bond_type = chem_bond_to_token(bond_type)
@@ -745,13 +939,13 @@ def normalize_bond_info(bond_info, frag_atom_indices):
         # Identify target atom indices from the bond information
         atom_route_pos_group = defaultdict(list)
         tgt_atom_route_pos_group_cnt = defaultdict(int)
-        for tgt_atom_idx in tgt_atom_indices:
+        for tgt_atom_idx in list(set(tgt_atom_indices)):
             tgt_atom_route_pos_group_cnt[atom_route_pos_symbol[tgt_atom_idx]] += 1
         
         for i in range(total_atoms):
             atom_route_pos_group[atom_route_pos_symbol[i]].append(i)
 
-        tgt_group_route_str = '+'.join(sorted([atom_route_symbol[comb[0]][comb[1]] for comb in combinations(sorted(tgt_atom_indices), 2)]))
+        tgt_group_route_str = '+'.join(sorted([atom_route_symbol[comb[0]][comb[1]] for comb in combinations(sorted(list(set(tgt_atom_indices))), 2)]))
 
 
         # combination of atom indices
@@ -807,7 +1001,7 @@ def normalize_bond_info(bond_info, frag_atom_indices):
         for atom_group in atom_route_pos_group.values():
             tmp1 = []
             tmp2 = []
-            for i in tgt_atom_indices:
+            for i in list(set(tgt_atom_indices)):
                 if i in atom_group:
                     tmp1.append(i)
             for i in result_list:
@@ -847,7 +1041,7 @@ def normalize_bond_info(bond_info, frag_atom_indices):
 
         for candidate_pair in tgt_same_pos_group:
             for pairs in generate_pairs_iter(candidate_pair):
-                tmp_tgt_pre_to_post_idx = {}
+                tmp_tgt_pre_to_post_idx = bidict()
                 for pair in pairs:
                     tmp_tgt_pre_to_post_idx[pair[0]] = pair[1]
                     flag = True
@@ -857,6 +1051,21 @@ def normalize_bond_info(bond_info, frag_atom_indices):
                             break
                     if not flag:
                         break
+                        
+                for comb in combinations(list(range(len(pairs))), 2):
+                    pre_idx1 = pairs[comb[0]][0]
+                    pre_idx2 = pairs[comb[1]][0]
+                    if pre_idx1 > pre_idx2:
+                        pre_idx1, pre_idx2 = pre_idx2, pre_idx1
+                    post_idx1 = pairs[comb[0]][1]
+                    post_idx2 = pairs[comb[1]][1]
+                    if post_idx1 > post_idx2:
+                        post_idx1, post_idx2 = post_idx2, post_idx1
+                    if atom_route_symbol[pre_idx1][pre_idx2] != atom_route_symbol[post_idx1][post_idx2]:
+                        flag = False
+                        break
+
+
                 else:
                     for key, value in tmp_tgt_pre_to_post_idx.items():
                         tgt_pre_to_post_idx[key] = value
@@ -914,17 +1123,15 @@ def normalize_bond_info(bond_info, frag_atom_indices):
         # Prepare final bond information
         final_bond_info = [bond_info[0]]
         temp = [(post_to_pre_idx.index(bond_idx), bond_type) for bond_idx, bond_type in zip(bond_info[1::2], bond_info[2::2])]
-        temp = sorted(temp, key=lambda x: x[0])
+        temp = sorted(temp, key=lambda x: (x[0], sort_order.get(x[1], float('inf'))))
         for t in temp:
             final_bond_info.append(t[0])
             final_bond_info.append(t[1])
 
         final_bond_info = tuple(final_bond_info)
-        print(f'{frag_atom_indices} -> {new_atom_indices}')
-        print(f'{bond_info} -> {final_bond_info}')
-        print()
         
-    except Exception as e:
+    except TimeoutException as e:
+        print(f'Timeout occurred in normalize_bond_info after {timeout_seconds} seconds: {bond_info}')
         final_bond_info = bond_info.copy()
         final_atom_indices = frag_atom_indices.copy()
         return final_bond_info, final_atom_indices
