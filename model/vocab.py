@@ -303,8 +303,7 @@ class Fragmentizer:
             return Counter(dict(count_labels))
 
 class Vocab:
-    def __init__(self, atom_tokens_path, fragment_label_path, threshold, max_seq_len = 100):
-        self.maxseq_len = max_seq_len
+    def __init__(self, atom_tokens_path, fragment_label_path, threshold):
         atom_tokens = Fragmentizer.load_token_count(atom_tokens_path, no_count=True)
         fragment_labels = Fragmentizer.load_token_count(fragment_label_path)
         self.vocab = set([key for key in atom_tokens.keys() if ':' not in key[2::2]])
@@ -359,7 +358,11 @@ class Vocab:
                 current_frag_idx += 1
                 order_frag_idx = current_frag_idx
                 visited.update(atom_mapping)
-                result =  self.tree.search(fragment_label, s_bond_idx)
+                if s_bond_idx == -1:
+                    start_atom_idx = atom_mapping.index(max_atom_score_idx)
+                else:
+                    start_atom_idx = None
+                result =  self.tree.search(fragment_label, s_bond_idx, start_atom_idx=start_atom_idx)
                 if result is None:
                     return None
                 root_next, sub_vocab_list, local_atom_map = result
@@ -378,8 +381,8 @@ class Vocab:
                         merge_bond_poses.append((sub_vocab_idx, i))
 
                     vocab_list.append(sub_vocab)
-                
-                merge_bond_poses.remove((root_next[2][0], root_next[2][1]))
+                if root_next[2][1] != -1:
+                    merge_bond_poses.remove((root_next[2][0], root_next[2][1]))
                 for sub_vocab_idx, sub_vocab in enumerate(sub_vocab_list):
                         for i, next_v in enumerate(sub_vocab['next']):
                             merge_bond_poses.remove((sub_vocab_idx, next_v[0]))
@@ -403,6 +406,7 @@ class Vocab:
                                     if neighbor_idx in atom_mapping2:
                                         next_frag_idx = i
                                         next_bond_atom_idx = atom_mapping2.index(neighbor_idx)
+                                        visited.add(neighbor_idx)
                                         for j, joint_atom_i in enumerate(fragment_labels[next_frag_idx][1::2]):
                                             if joint_atom_i == next_bond_atom_idx:
                                                 next_bond_pos = j
@@ -477,15 +481,15 @@ class Vocab:
         
         return vocab_list
     
-    def tensorize(self, mol):
+    def tensorize(self, mol, max_seq_len = 100):
         vocab_tree = self.assign_vocab(mol)
         # print('\n'.join([str(i) + ': ' + str(vt) for i, vt in enumerate(vocab_tree)]))
         if vocab_tree is None:
             return None
         
-        vocab_tensor = torch.empty(self.maxseq_len, dtype=torch.int32)
-        order_tensor = torch.empty(self.maxseq_len, 3, dtype=torch.int32) # (parent_idx, parent_bond_pos, bond_pos)
-        mask_tensor =  torch.zeros(self.maxseq_len, dtype=torch.bool)  # 初期値は False
+        vocab_tensor = torch.empty(max_seq_len, dtype=torch.int32)
+        order_tensor = torch.empty(max_seq_len, 3, dtype=torch.int32) # (parent_idx, parent_bond_pos, bond_pos)
+        mask_tensor =  torch.zeros(max_seq_len, dtype=torch.bool)  # 初期値は False
         mask_tensor[:len(vocab_tree)] = True
 
         parent_data = {}
@@ -575,12 +579,19 @@ class FragmentNode:
         else:
             self.children[key].leaves.append(value)
 
-    def display(self, level=0, prefix=""):
+    def display(self, level=0, prefix="", max_depth=None):
         """
         Recursively print the tree structure for visualization with tree-like characters.
-        :param level: Current indentation level for the node.
-        :param prefix: Prefix string used for tree visualization.
+        
+        Args:
+            level (int): Current indentation level for the node.
+            prefix (str): Prefix string used for tree visualization.
+            max_depth (int, optional): Maximum depth to display. If None, display all levels.
         """
+        # Check if the current depth exceeds the max_depth
+        if max_depth is not None and level > max_depth:
+            return
+        
         # Display the current node's leaves
         if self.leaves:
             print(f"{prefix}+- : {self.leaves}")
@@ -591,14 +602,22 @@ class FragmentNode:
             connector = "`-" if is_last else "|-"
             child_prefix = prefix + ("   " if is_last else "|  ")
             print(f"{prefix}{connector} {key}")
-            child.display(level + 1, child_prefix)
+            child.display(level + 1, child_prefix, max_depth=max_depth)
 
-    def _write_to_file(self, file, prefix=""):
+    def _write_to_file(self, file, prefix="", level=0, max_depth=None):
         """
-        Recursively write the tree structure to an open file object.
-        :param file: An open file object to write the tree structure.
-        :param prefix: Prefix string used for tree visualization.
+        Recursively write the tree structure to an open file object with depth control.
+        
+        Args:
+            file: An open file object to write the tree structure.
+            prefix (str): Prefix string used for tree visualization.
+            level (int): Current indentation level for the node.
+            max_depth (int, optional): Maximum depth to write. If None, write all levels.
         """
+        # Check if the current depth exceeds the max_depth
+        if max_depth is not None and level > max_depth:
+            return
+
         if self.leaves:
             file.write(f"{prefix}+- : {self.leaves}\n")
 
@@ -607,7 +626,7 @@ class FragmentNode:
             connector = "`-" if is_last else "|-"
             child_prefix = prefix + ("   " if is_last else "|  ")
             file.write(f"{prefix}{connector} {key}\n")
-            child._write_to_file(file, child_prefix)
+            child._write_to_file(file, child_prefix, max_depth=max_depth)
     
 class FragmentTree:
     """
@@ -619,13 +638,18 @@ class FragmentTree:
     def __init__(self):
         self.root = FragmentNode(depth=0, score=0)
     
-    def search(self, fragment_info, bond_pos):
+    def search(self, fragment_info, bond_pos, start_atom_idx=None):
         vocab_list = []
         visited = set()
         global_atom_map = bidict()
-        root_next = [-1, fragment_info[2*bond_pos+2], (-1,-1)]
+        if bond_pos == -1:
+            root_next = [-1, '', (-1,-1)]
+        else:
+            root_next = [-1, fragment_info[2*bond_pos+2], (-1,-1)]
         smiles = fragment_info[0]
         mol = Chem.MolFromSmiles(smiles)
+        total_atom_nums = mol.GetNumAtoms()
+        current_atom_nums = 0
         next_fragment_infoes = [{'frag': fragment_info, 'bond_pos': bond_pos, 'parent': (-1, -1), 'atom_map': list(range(mol.GetNumAtoms()))}]
         while len(next_fragment_infoes) > 0:
             current_fragment_info_dict = next_fragment_infoes.pop(0)
@@ -636,10 +660,34 @@ class FragmentTree:
             current_atom_map = current_fragment_info_dict['atom_map']
             smiles = current_fragment_info[0]
             mol = Chem.MolFromSmiles(smiles)
+
+            results = []
             if current_bond_pos == -1:
-                pass
+                bond_types = []
+                start_atom = mol.GetAtomWithIdx(start_atom_idx)
+                symbol = str(start_atom.GetAtomicNum())
+                for neighbor in start_atom.GetNeighbors():
+                    neighbor_idx = neighbor.GetIdx()
+                    bond = mol.GetBondBetweenAtoms(start_atom_idx, neighbor_idx)
+                    bond_types.append(chem_bond_to_token(bond.GetBondType()))
+                for current_bond_info in current_bond_infoes:
+                    if start_atom_idx == current_bond_info[0]:
+                        bond_types.append(current_bond_info[1])
+                bond_types = sorted(bond_types, key=lambda x: self.bond_sord_order[x])
+                tree_keys = [bond_types[0], symbol]
+                if len(bond_types) > 1:
+                    tree_keys.append(''.join(bond_types[1:]))
+                
+                current_node = self.root
+                for i, key in enumerate(tree_keys):
+                    if key in current_node.children:
+                        current_node = current_node.children[key]
+                        if (i == len(tree_keys) - 1 or i % 2 == 0) and len(current_node.leaves) > 0:
+                            results.extend([(leave, current_node.score) for leave in current_node.leaves])
+                    else:
+                        break
+
             else:
-                results = []
                 tree_keys = FragmentTree.get_tree_keys(Chem.MolFromSmiles(smiles), current_bond_infoes, start_bond_pos=current_bond_pos)
                 current_node = self.root
                 for i, key in enumerate(tree_keys):
@@ -650,27 +698,40 @@ class FragmentTree:
                     else:
                         break
             if len(results) == 0:
-                return None
+                raise ValueError(f'Not Found Atom Token: {current_fragment_info}')
             results = sorted(results, key=lambda x: x[1], reverse=True)
 
             for result, _ in results:
                 qry_frag_info = result[0]
                 qry_start_pos = result[1]
-                matched_q_to_t_atom_map = match_fragment(tgt_frag_info=current_fragment_info, tgt_start_pos=current_bond_pos, qry_frag_info=qry_frag_info, qry_start_pos=qry_start_pos)
+                if current_bond_pos == -1:
+                    start_mol = Chem.MolFromSmiles(qry_frag_info[0])
+                    qry_start_atom = start_mol.GetAtomWithIdx(0)
+                    if start_atom.GetAtomicNum() != qry_start_atom.GetAtomicNum():
+                        continue
+                    if start_atom.GetNumExplicitHs() != qry_start_atom.GetNumExplicitHs():
+                        continue
+                    matched_q_to_t_atom_map = {start_atom_idx: start_atom_idx}
+                else:
+                    matched_q_to_t_atom_map = match_fragment(tgt_frag_info=current_fragment_info, tgt_start_pos=current_bond_pos, qry_frag_info=qry_frag_info, qry_start_pos=qry_start_pos)
                 if matched_q_to_t_atom_map is not None:
                     break
             else:
-                return None
+                raise ValueError(f'Not Found Atom Token: {current_fragment_info}')
             
             cut_remaining_atom_indices = set()
-            flag = False
-            for bond_idx, bond_type in zip(qry_frag_info[1::2], qry_frag_info[2::2]):
-                if not flag and (bond_idx == qry_frag_info[2 * qry_start_pos + 1]) and (bond_type == qry_frag_info[2 * qry_start_pos + 2]):
-                    flag = True
-                    continue
-                cut_remaining_atom_indices.add(matched_q_to_t_atom_map[bond_idx])
-            cut_remaining_atom_indices = sorted(list(cut_remaining_atom_indices))
-            visited.update([current_atom_map[v] for v in matched_q_to_t_atom_map.values()])
+            if current_bond_pos == -1:
+                cut_remaining_atom_indices.add(start_atom_idx)
+                visited.update([start_atom_idx])
+            else:
+                flag = False
+                for bond_idx, bond_type in zip(qry_frag_info[1::2], qry_frag_info[2::2]):
+                    if not flag and (bond_idx == qry_frag_info[2 * qry_start_pos + 1]) and (bond_type == qry_frag_info[2 * qry_start_pos + 2]):
+                        flag = True
+                        continue
+                    cut_remaining_atom_indices.add(matched_q_to_t_atom_map[bond_idx])
+                cut_remaining_atom_indices = sorted(list(cut_remaining_atom_indices))
+                visited.update([current_atom_map[v] for v in matched_q_to_t_atom_map.values()])
 
             cut_atom_pairs = []
             for cut_atom_idx in cut_remaining_atom_indices:
@@ -679,8 +740,11 @@ class FragmentTree:
                     neighbor_idx = neighbor.GetIdx()
                     if current_atom_map[neighbor_idx] not in visited:
                         cut_atom_pairs.append((cut_atom_idx, neighbor_idx))
-                        
+
             new_fragment_infoes, atom_map = split_fragment_info(current_fragment_info, cut_atom_pairs, current_atom_map)
+
+            if current_parent[0] == -1 and current_bond_pos == -1:
+                root_next[2] = (0, -1)
 
             for frag_idx, new_fragment_info_with_joint in enumerate(new_fragment_infoes):
                 new_fragment_info = new_fragment_info_with_joint[0]
@@ -690,36 +754,43 @@ class FragmentTree:
                     joint_dict = {bond_idx: value for bond_idx, value in joint_info}
                     next_parent_frag_idx = len(vocab_list)
                     
-                    for current_bond_pos, joint_info in enumerate(zip(new_fragment_info[1::2], new_fragment_info[2::2])):
-                        if current_bond_pos in joint_dict:
-                            mappping = [k for k, v in sorted(atom_map.items(), key=lambda x: x[1][1]) if v[0] == joint_dict[current_bond_pos][0]]
+                    parent_flag = False
+                    for cur_bond_pos, joint_info in enumerate(zip(new_fragment_info[1::2], new_fragment_info[2::2])):
+                        if cur_bond_pos in joint_dict:
+                            mappping = [k for k, v in sorted(atom_map.items(), key=lambda x: x[1][1]) if v[0] == joint_dict[cur_bond_pos][0]]
                             
                             next_fragment_infoes.append(
-                                {'frag': new_fragment_infoes[joint_dict[current_bond_pos][0]][0], 
-                                 'bond_pos': joint_dict[current_bond_pos][1], 
-                                 'parent': (next_parent_frag_idx, current_bond_pos, new_fragment_infoes[joint_dict[current_bond_pos][0]][0][2*joint_dict[current_bond_pos][1]+2]),
+                                {'frag': new_fragment_infoes[joint_dict[cur_bond_pos][0]][0], 
+                                 'bond_pos': joint_dict[cur_bond_pos][1], 
+                                 'parent': (next_parent_frag_idx, cur_bond_pos, new_fragment_infoes[joint_dict[cur_bond_pos][0]][0][2*joint_dict[cur_bond_pos][1]+2]),
                                  'atom_map': mappping
                                  })
-                        else:
-                            if current_parent[0] == -1:
-                                root_next[2] = (0, current_bond_pos)
+                        else: # グループ内のフラグメントに接続する結合でない場合
+                            if (current_parent[0] == -1 
+                                and current_bond_pos != -1 
+                                and current_bond_infoes[current_bond_pos][1] == joint_info[1]):
+                                root_next[2] = (0, cur_bond_pos) # このフラグメントグループの初めの結合部分 (frag_id, bond_pos)
                             else:
-                                if len(joint_dict) == 0:
+                                if len(joint_dict) == 0: # 切断されず次のフラグメントがない場合
                                     atom_idx = current_fragment_info[1::2][current_bond_pos]
                                     for k, (atom_idx2, bond_type) in enumerate(zip(new_fragment_info[1::2], new_fragment_info[2::2])):
                                         if atom_idx2 == atom_idx and current_parent[2] == bond_type:
                                             vocab_list[current_parent[0]]['next'].append((current_parent[1], current_parent[2], (next_parent_frag_idx, k)))
                                             break
                                     break
-                                else:
-                                    vocab_list[current_parent[0]]['next'].append((current_parent[1], current_parent[2], (next_parent_frag_idx, current_bond_pos)))
+                                elif current_parent[0] != -1:
+                                    if not parent_flag:
+                                        parent_flag = True
+                                        vocab_list[current_parent[0]]['next'].append((current_parent[1], current_parent[2], (next_parent_frag_idx, cur_bond_pos)))
                         
                     mappping = [k for k, v in sorted(atom_map.items(), key=lambda x: x[1][1]) if v[0] == frag_idx]
                     for i, atom_i in enumerate(mappping):
                         global_atom_map[atom_i] = (len(vocab_list), i)
                     vocab_list.append({'frag': qry_frag_info, 'idx': -1, 'next': []})
+                    current_atom_nums += len(mappping)
                     break
-
+        if current_atom_nums != total_atom_nums:
+            raise ValueError(f'Cannot Build Fragment Tree: {fragment_info}')
         return tuple(root_next), vocab_list, global_atom_map
     
     def add_fragment(self, fragment, fragment_mol):
@@ -824,11 +895,11 @@ class FragmentTree:
         with open(file_path, "rb") as file:
             return dill.load(file)
 
-    def display_tree(self):
+    def display_tree(self, max_depth=None):
         """
         Display the entire tree structure for visualization.
         """
-        self.root.display()
+        self.root.display(max_depth=max_depth)
 
     def save_to_file_incrementally(self, file_path):
         """
@@ -840,24 +911,13 @@ class FragmentTree:
 
 if __name__ == "__main__":
     if False:
-        matcher =  Fragmentizer()
-        smiles_list = [
-            'OC1(O)CCCCC1',
-            "CC(C)CCCCCCOC(=O)c1cc(C(=O)OCCCCCCC(C)C)c(C(=O)O)cc1C(=O)O",
-            'CC#CC=CC(=O)CCC',
-            'CN(C)C(N(C)C)(N(C)c1ccccc1)N(C)c1ccccc1',
-            'Cc1ccc(-c2cc(O)cc3c2Cc2ccccc2C3)cc1',
-            'C=C(C)C(C)(C)C(O)CCCCCCCCC(C)=O',
-        ]
-
-        for smiles in smiles_list:
-            molecule = Chem.MolFromSmiles(smiles)
-            count_labels, fragments, atom_tokens = matcher.split_molecule_by_functional_groups(molecule)
-            print(f"SMILES: {smiles}")
-            for count_label, fragment in zip(count_labels, fragments):
-                print(f"Fragment: {count_label[0]}, Bond: {count_label[1:]}")
-            print()
-    elif True:
+        new_frag_info = normalize_bond_info(('CCC', 0, '-', 2, '='), frag_atom_indices = list(range(9)), timeout_seconds=1000)
+        print(new_frag_info)
+    elif False:
+        mol = Chem.MolFromSmiles('CC(=[Og])C')
+        smiles = Chem.MolToSmiles(mol)
+        print(smiles)
+    elif False:
     # elif False:
         atom_tokens_file = '/workspaces/hgraph/mnt/Ms2z/data/graph/pubchem/atom_tokens.txt'
         counter_labels_file = '/workspaces/hgraph/mnt/Ms2z/data/graph/pubchem/count_labels.pkl'
@@ -869,7 +929,23 @@ if __name__ == "__main__":
             # 'COc1ccc(C)cc1S(=O)(=O)C(C)C',
             # 'COc1ccccc1C(O)c1ccccc1C',
             # 'CC1C2CCC(=Cc3ccccc3)C(=O)C2(C)CCC12OCCO2',
-            'CC(C)CC1CC(=O)CC2CCC(C)C(C)C21',
+            # 'CC(C)CC1CC(=O)CC2CCC(C)C(C)C21',
+            # 'O=C(O)CC(O)(CC(=O)OC(O)CCCCCCCO)C(=O)O',
+            # 'C=CC(=O)N(CCC(=O)OCCCC)C(C)C',
+            # 'COc1c(OC)c(O)c2cc(C#N)ccc2c1O',
+            # 'O=S(=O)(O)c1cc2cccc(O)c2c(O)c1N=Nc1cccc2ccccc12',
+            # 'COc1ccc(C=CC(=O)OC(C)C)cc1',
+            # 'Cn1ncnc1-c1cnn(-c2ccccc2)c1N',
+            # 'C=CCNCC(C)CCCC',
+            # 'CCCCCCC=CN(CCCCCCCC)CCCCCCCC',
+            # 'CC(=CC=O)c1ccc(N(C)C)cc1',
+            # 'CNCCc1cccc(-c2ccc(C)cc2OC)c1',
+            # 'CCC(CCCCCCCCC(=O)O)CCC(=O)O',
+            'CC(C)=CCCC(C)=CCCC(C)=CCOC(=O)CCCC(=O)OCC=C(C)CCC=C(C)CCC=C(C)C',
+        ]
+        error_smiles = [
+            'P=C=Cc1ccccc1', # P のトークンがないのでエラー
+            'CC#CCO[CH]CCCCCCCC', # [CH] のトークンがないのでエラー
         ]
         for smiles in smiles_list:
             input_mol = Chem.MolFromSmiles(smiles)
@@ -885,35 +961,66 @@ if __name__ == "__main__":
         counter_labels_file = '/workspaces/hgraph/mnt/Ms2z/data/graph/pubchem/count_labels.pkl'
         smiles_file = '/workspaces/hgraph/mnt/Ms2z/data/SMILES/pubchem/pubchem_smiles_10k.pkl'
         failed_smiles_file = '/workspaces/hgraph/mnt/Ms2z/data/SMILES/pubchem/pubchem_failed_smiles.txt'
+        max_seq_len = 100
         vocab = Vocab(atom_tokens_file, counter_labels_file, threshold=0)
 
         smiles_list = dill.load(open(smiles_file, 'rb'))
         
-        for i, smiles in tqdm(enumerate(smiles_list), total=len(smiles_list), mininterval=0.5):
-            try:
-                output_smiles = 'None'
-                input_mol = Chem.MolFromSmiles(smiles)
-                input_smiles = Chem.MolToSmiles(input_mol, canonical=True)
-                # print(f"Input SMILES: {input_smiles}")
-                tensor = vocab.tensorize(input_mol)
-                if tensor is None:
-                    # print(f'Input SMILES: {input_smiles}')
-                    raise ValueError('Tensorization Failed')
-                output_mol = vocab.detensorize(*tensor)
-                output_smiles = Chem.MolToSmiles(output_mol, canonical=True)
-                # print(f'detensorize: {output_smiles}')
-                result = input_smiles == output_smiles
+        total_cnt = 0
+        success_cnt = 0
+        vocab_tensors = []
+        order_tensors = []
+        mask_tensors = []
+        with tqdm(total=len(smiles_list), mininterval=0.5) as pbar:
+            for smiles1 in smiles_list:
+                for smiles in smiles1.split('.'):
+                    try:
+                        output_smiles = 'None'
+                        input_mol = Chem.MolFromSmiles(smiles)
+                        input_smiles = Chem.MolToSmiles(input_mol, canonical=True)
+                        # print(f"Input SMILES: {input_smiles}")
+                        tensor = vocab.tensorize(input_mol, max_seq_len=max_seq_len)
+                        if tensor is None:
+                            # print(f'Input SMILES: {input_smiles}')
+                            raise ValueError('Tensorization Failed')
+                        output_mol = vocab.detensorize(*tensor)
+                        output_smiles = Chem.MolToSmiles(output_mol, canonical=True)
+                        # print(f'detensorize: {output_smiles}')
+                        result = input_smiles == output_smiles
 
-                if not result:
-                    # print(f'Input SMILES: {input_smiles}')
-                    # print(f'detensorize: {output_smiles}')
-                    raise ValueError('Isomorphic Check Failed')
-            except Exception as e:
-                if str(e) == 'Error: Ring not in vocabulary.':
-                    continue
-                with open(failed_smiles_file, 'a') as f:
-                    f.write(f'{i}\t{smiles}\t{output_smiles}\t{str(e)}\n')
-                    pass
+                        if not result:
+                            # print(f'Input SMILES: {input_smiles}')
+                            # print(f'detensorize: {output_smiles}')
+                            raise ValueError('Isomorphic Check Failed')
+
+                        vocab_tensor, order_tensor, mask_tensor = tensor
+                        vocab_tensors.append(vocab_tensor)
+                        order_tensors.append(order_tensor)
+                        mask_tensors.append(mask_tensor)
+
+                        success_cnt += 1
+                    except Exception as e:
+                        if str(e) == 'Error: Ring not in vocabulary.':
+                            continue
+                        with open(failed_smiles_file, 'a') as f:
+                            f.write(f'{total_cnt}\t{smiles}\t{output_smiles}\t{str(e)}\n')
+                            pass
+                    finally:
+                        pbar.update(1)
+                        total_cnt += 1
+                        pbar.set_postfix_str(f'Success: {success_cnt}/{total_cnt} ({success_cnt/total_cnt:.2%})')
+        vocab_tensors = torch.stack(vocab_tensors)
+        order_tensors = torch.stack(order_tensors)
+        mask_tensors = torch.stack(mask_tensors)
+        tensor_file = '/workspaces/hgraph/mnt/Ms2z/data/graph/pubchem/vocab_tensors.pt'
+
+        torch.save({
+            'vocab': vocab_tensors,
+            'order': order_tensors,
+            'mask': mask_tensors,
+            'length': max_seq_len,
+        }, tensor_file)
+
     elif False:
         frag_info = ('OCO', 1, '-', 2, '-')
         normalize_frag_info = normalize_bond_info(frag_info, list(range(6)), timeout_seconds=1000)

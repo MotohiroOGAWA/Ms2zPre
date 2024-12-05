@@ -3,7 +3,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import rdmolops
 
-from itertools import product, combinations, permutations
+from itertools import product, combinations, permutations, chain
 from collections import Counter
 from collections import defaultdict
 from bidict import bidict
@@ -493,8 +493,10 @@ def match_fragment(tgt_frag_info, tgt_start_pos, qry_frag_info, qry_start_pos):
                 for tgt_route_idx in tgt_route_indices:
                     tmp_atom_idx_dict = copy.deepcopy(atom_idx_dict)
                     for qry_atom_idx, tgt_atom_idx in zip(qry_route_tree['idx'], tgt_route_trees[tgt_route_idx]['idx']):
-                        if qry_atom_idx in tmp_atom_idx_dict and tmp_atom_idx_dict[qry_atom_idx] != tgt_atom_idx:
+                        if (qry_atom_idx in tmp_atom_idx_dict) and tmp_atom_idx_dict[qry_atom_idx] != tgt_atom_idx:
                             break
+                        if tgt_atom_idx in tmp_atom_idx_dict.values():
+                            continue
                         tmp_atom_idx_dict[qry_atom_idx] = tgt_atom_idx
                     else:
                         new_atom_idx_dicts.append(tmp_atom_idx_dict)
@@ -502,7 +504,8 @@ def match_fragment(tgt_frag_info, tgt_start_pos, qry_frag_info, qry_start_pos):
 
         if len(atom_idx_dicts) == 0:
             break
-
+    
+    atom_idx_dicts = [atom_idx_dict for atom_idx_dict in atom_idx_dicts if len(atom_idx_dict) == len(qry_mol.GetAtoms())]
     if len(atom_idx_dicts) == 0:
         return None
 
@@ -529,7 +532,7 @@ def build_route_tree(frag_info, start_bond_pos, mol=None, options=None):
     start_atom = mol.GetAtomWithIdx(start_atom_idx)
     current_routes = [{'idx': [start_atom_idx], 'route': []}]
     current_routes[0]['route'].append(bond_infoes[start_bond_pos][1])
-    current_routes[0]['route'].append(start_atom.GetSymbol())
+    current_routes[0]['route'].append(get_atom_symbol(start_atom))
     visited.add(bond_infoes[start_bond_pos][0])
     for i, bond_info in enumerate(bond_infoes):
         if i == start_bond_pos:
@@ -566,7 +569,7 @@ def build_route_tree(frag_info, start_bond_pos, mol=None, options=None):
                 new_route['route'].append(bond_type)
                 if route_cnt < max_route:
                     new_route['idx'].append(neighbor_idx)
-                    new_route['route'].append(neighbor.GetSymbol())
+                    new_route['route'].append(get_atom_symbol(neighbor))
                 
                     for i, bond_info in enumerate(bond_infoes):
                         if neighbor_idx != bond_info[0]:
@@ -587,7 +590,13 @@ def build_route_tree(frag_info, start_bond_pos, mol=None, options=None):
         completed_routes.append(current_route)
     
     return completed_routes
-    
+
+def get_atom_symbol(atom):
+    symbol = atom.GetSymbol()
+    if atom.GetNumExplicitHs() > 0:
+        symbol += "H" * atom.GetNumExplicitHs()
+        symbol = f"[{symbol}]"
+    return symbol
 
 def get_atom_tokens(mol):
     """
@@ -694,9 +703,7 @@ def normalize_bond_info(bond_info, frag_atom_indices, timeout_seconds=10):
     """
     sort_order = {'-': 0, '=': 1, '#': 2, ':': 3}
     signal.signal(signal.SIGALRM, timeout_handler)
-    # signal.alarm(timeout_seconds)
-
-    sort_order = {'-': 0, '=': 1, '#': 2, ':': 3}
+    signal.alarm(timeout_seconds)
 
     try:
         if len(bond_info) == 1:
@@ -907,6 +914,8 @@ def normalize_bond_info(bond_info, frag_atom_indices, timeout_seconds=10):
         for atom in mol.GetAtoms():
             atom_idx = atom.GetIdx()
             atom_symbol = atom.GetSymbol()
+            if atom.GetNumExplicitHs() > 0:
+                atom_symbol += 'H' * atom.GetNumExplicitHs()
             atom_idx_symbol[str(atom_idx)] = atom_symbol
         
         # route -> position
@@ -960,35 +969,13 @@ def normalize_bond_info(bond_info, frag_atom_indices, timeout_seconds=10):
         for i in range(len(lists)):
             if selection_counts[i] > 0:
                 select_indices_comb.append(list(combinations(lists[i], selection_counts[i])))
-        current_select_indices = [0] * len(select_indices_comb)
+        sorted_tgt_candidates = sorted([tuple(sorted(sum(comb, ()))) for comb in product(*select_indices_comb)])
 
-        result_list = []
-        for i in range(len(current_select_indices)):
-            result_list.extend(select_indices_comb[i][0])
-
-        while True:
-            ans_group_route_str = '+'.join(sorted([atom_route_symbol[comb[0]][comb[1]] for comb in list(combinations(sorted(result_list), 2))]))
+        for tgt_candidate in sorted_tgt_candidates:
+            ans_group_route_str = '+'.join(sorted([atom_route_symbol[comb[0]][comb[1]] for comb in list(combinations(sorted(tgt_candidate), 2))]))
             if ans_group_route_str == tgt_group_route_str:
+                result_list = tgt_candidate
                 break
-            
-            min_i = -1
-            result_list = None
-            for i, select_indices in enumerate(current_select_indices):
-                tmp = []
-                if select_indices  >= len(select_indices_comb[i]) - 1:
-                    continue
-                for j in range(len(current_select_indices)):
-                    if i == j:
-                        tmp.extend(select_indices_comb[j][current_select_indices[j] + 1])
-                    else:
-                        tmp.extend(select_indices_comb[j][current_select_indices[j]])
-                tmp = tuple(sorted(tmp))
-                if min_i == -1 or tmp < result_list:
-                    min_i = i
-                    result_list = tmp
-            if min_i == -1:
-                break
-            current_select_indices[min_i] += 1
         
         adjacency_matrix = Chem.GetAdjacencyMatrix(mol)
         post_to_pre_idx = [0] * total_atoms
@@ -1011,7 +998,7 @@ def normalize_bond_info(bond_info, frag_atom_indices, timeout_seconds=10):
                 raise ValueError("Invalid atom group.")
             if len(tmp1) == 1 and len(tmp2) == 1:
                 tgt_pre_to_post_idx[tmp1[0]] = tmp2[0]
-            else:
+            elif len(tmp1) > 1 and len(tmp2) > 1:
                 tgt_same_pos_group.append((tmp1, tmp2))
 
         def generate_pairs_iter(candidate_pair, selected=None):
@@ -1039,38 +1026,27 @@ def normalize_bond_info(bond_info, frag_atom_indices, timeout_seconds=10):
                 # Recursively generate pairs from the remaining elements
                 yield from generate_pairs_iter((remaining_0, remaining_1), selected + [pair])
 
-        for candidate_pair in tgt_same_pos_group:
-            for pairs in generate_pairs_iter(candidate_pair):
-                tmp_tgt_pre_to_post_idx = bidict()
-                for pair in pairs:
-                    tmp_tgt_pre_to_post_idx[pair[0]] = pair[1]
-                    flag = True
-                    for key, value in tgt_pre_to_post_idx.items():
-                        if atom_route_symbol[pair[0]][key] != atom_route_symbol[pair[1]][value]:
-                            flag = False
-                            break
-                    if not flag:
-                        break
-                        
-                for comb in combinations(list(range(len(pairs))), 2):
-                    pre_idx1 = pairs[comb[0]][0]
-                    pre_idx2 = pairs[comb[1]][0]
-                    if pre_idx1 > pre_idx2:
-                        pre_idx1, pre_idx2 = pre_idx2, pre_idx1
-                    post_idx1 = pairs[comb[0]][1]
-                    post_idx2 = pairs[comb[1]][1]
-                    if post_idx1 > post_idx2:
-                        post_idx1, post_idx2 = post_idx2, post_idx1
-                    if atom_route_symbol[pre_idx1][pre_idx2] != atom_route_symbol[post_idx1][post_idx2]:
-                        flag = False
-                        break
-
-
-                else:
-                    for key, value in tmp_tgt_pre_to_post_idx.items():
-                        tgt_pre_to_post_idx[key] = value
-                    break
+        bond_pos_counter = Counter([(bond_info[2 * i + 1],bond_info[2 * i + 2]) for i in range(degree)])
+        bond_type_dict = {bond_info[2 * i + 1]: bond_info[2 * i + 2] for i in range(degree)}
+        def calc_pair_score(pair):
+            # score = sum([(4*bond_pos_counter[p[0]]+(3-sort_order[])) * 4**(p[1]) for p in pair])
             pass
+            # return score
+
+        if len(tgt_same_pos_group) > 0:
+            pairs_iters = [list(generate_pairs_iter(candidate_pair)) for candidate_pair in tgt_same_pos_group]
+            candidate_pairs = list(product(*pairs_iters))
+            candidate_pairs = sorted(candidate_pairs, key=lambda x: calc_pair_score(sum(x, [])))
+            for candidate_pair in candidate_pairs:
+                candidate_pair = sum(candidate_pair, [])
+                candidate_pair.extend([(pre_idx, post_idx) for pre_idx, post_idx in tgt_pre_to_post_idx.items()])
+                for pair in combinations(candidate_pair, 2):
+                    if atom_route_symbol[pair[0][0]][pair[1][0]] != atom_route_symbol[pair[0][1]][pair[1][1]]:
+                        break
+                else:
+                    for pre_idx, post_idx in candidate_pair:
+                        tgt_pre_to_post_idx[pre_idx] = post_idx
+                    break
 
         post_ori_idx = result_list[0]
         for key, value in tgt_pre_to_post_idx.items():
@@ -1131,7 +1107,7 @@ def normalize_bond_info(bond_info, frag_atom_indices, timeout_seconds=10):
         final_bond_info = tuple(final_bond_info)
         
     except TimeoutException as e:
-        print(f'Timeout occurred in normalize_bond_info after {timeout_seconds} seconds: {bond_info}')
+        raise TimeoutException(f'Timeout occurred in normalize_bond_info after {timeout_seconds} seconds: {bond_info}')
         final_bond_info = bond_info.copy()
         final_atom_indices = frag_atom_indices.copy()
         return final_bond_info, final_atom_indices
